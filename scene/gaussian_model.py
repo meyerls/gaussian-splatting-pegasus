@@ -8,6 +8,7 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+import copy
 
 import torch
 import numpy as np
@@ -19,7 +20,7 @@ import open3d as o3d
 from scipy.spatial.transform import Rotation
 from e3nn import o3
 import sphecerix
-
+import pyshtools as shtools
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
@@ -31,8 +32,6 @@ from utils.sh_utils import SH2RGB, RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-
-
 
 
 class GaussianModelBase:
@@ -60,6 +59,7 @@ class GaussianModelBase:
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
+        self._features_rest_original = torch.empty(0)
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -290,6 +290,8 @@ class GaussianModelBase:
 
         self.active_sh_degree = self.max_sh_degree
 
+        self._features_rest_original = copy.deepcopy(self._features_rest)
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -462,6 +464,7 @@ class GaussianModelBase:
 class GaussianModel(GaussianModelBase):
     def __init__(self, sh_degree):
         super().__init__(sh_degree)
+        self.R = torch.eye(3).to('cuda').type(torch.float32)
 
     def get_point_cloud(self):
         features_dc = self._features_dc.clone()
@@ -508,35 +511,119 @@ class GaussianModel(GaussianModelBase):
         self._rotation = torch.from_numpy(splat_rotated_quat).to('cuda').type(torch.float32)
 
     def apply_rotation_on_sh(self, R):
-        Robj = Rotation.from_matrix(R.cpu())
+
+        self.R = R @ self.R
+        def Rx(theta):
+            return np.array([[1, 0, 0],
+                             [0, np.cos(theta), -np.sin(theta)],
+                             [0, np.sin(theta), np.cos(theta)]])
+
+        def Z(angle):
+            return torch.asarray([
+                [1, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, np.cos(angle), 0, np.sin(angle), 0, 0, 0, 0, 0],
+                [0, 0, 1, 0, 0, 0, 0, 0, 0],
+                [0, - np.sin(angle), 0, np.cos(angle), 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, np.cos(2 * angle), 0, 0, 0, np.sin(2 * angle)],
+                [0, 0, 0, 0, 0, np.cos(angle), 0, np.sin(angle), 0],
+                [0, 0, 0, 0, 0, 0, 1, 0, 0],
+                [0, 0, 0, 0, 0, np.sin(angle), 0, np.cos(angle), 0],
+                [0, 0, 0, 0, np.sin(2 * angle), 0, 0, 0, np.cos(2 * angle)],
+            ]).to('cuda').type(torch.float32)
+
+
+        Robj = Rotation.from_matrix(self.R.cpu())
         # D_0 = sphecerix.tesseral_wigner_D(1, Robj)
+
+        if not torch.isclose(torch.det(R).cpu(), torch.asarray(1.0), atol=1e-4):
+            # Check if matrix R has det == 1. -1 indicates mirror/reflection
+            raise ValueError("Rotation matrix performs a reflection or improper rotation!")
 
         # dc = self._features_dc
         # Y_0 = dc.cpu().numpy()
         # Y_0_rotated = D_0 @ Y_0
         with torch.no_grad():
-            aby = torch.asarray(Robj.as_euler('yzy')).type(torch.float32)  # o3._rotation.matrix_to_angles(R.cpu())
+            aby = torch.asarray(Robj.as_euler('zyz')).type(torch.float32)  # o3._rotation.matrix_to_angles(R.cpu())
+            alpha, beta, gamma = np.asarray(aby)
 
-            # D_1 = torch.from_numpy(sphecerix.tesseral_wigner_D(1, Robj)).to('cuda').type(torch.float32)
-            D_1 = o3.wigner_D(1, aby[2], aby[1], aby[0]).to('cuda').type(torch.float32)
-            Y_1 = self._features_rest[:, [0, 1, 2]]
-            Y_1_rotated = torch.matmul(D_1, Y_1)  # torch.matmul(D_1, Y_1)  # torch.matmul(R, Y_1)
-            # Y_1_rotated.requires_grad = True
+            matrix = torch.asarray([
+                [1, 0, 0, 0],
+                [0, np.cos(alpha) * np.cos(gamma) - np.sin(alpha) * np.sin(gamma) * np.cos(beta),
+                 np.sin(alpha) * np.sin(beta),
+                 np.cos(alpha) * np.sin(gamma) + np.sin(alpha) * np.cos(gamma) * np.cos(beta)],
+                [0, np.sin(gamma) * np.sin(beta), np.cos(beta), -np.cos(gamma) * np.sin(beta)],
+                [0, -np.cos(alpha) * np.sin(gamma) * np.cos(beta) - np.sin(alpha) * np.cos(gamma),
+                 np.cos(alpha) * np.sin(beta),
+                 np.cos(alpha) * np.cos(gamma) * np.cos(beta) - np.sin(alpha) * np.sin(gamma)],
+            ]).to('cuda').type(torch.float32)
+
+            #x_rotation_plus = torch.asarray(Rotation.from_matrix(Rx(np.pi / 2)).as_euler('zyz')).type(torch.float32)
+            #x_plus = torch.eye(9).to('cuda').type(torch.float32)
+            #x_plus[1:4, 1:4] = o3.wigner_D(1, x_rotation_plus[2], x_rotation_plus[1], x_rotation_plus[0]).to(
+            #    'cuda').type(torch.float32)
+            #x_plus[4:9, 4:9] = o3.wigner_D(2, x_rotation_plus[2], x_rotation_plus[1], x_rotation_plus[0]).to(
+            #    'cuda').type(torch.float32)
+            #x_rotation_minus = torch.asarray(Rotation.from_matrix(Rx(-np.pi / 2)).as_euler('zyz')).type(torch.float32)
+            #x_minus = torch.eye(9).to('cuda').type(torch.float32)
+            #x_minus[1:4, 1:4] = o3.wigner_D(1, x_rotation_minus[2], x_rotation_minus[1], x_rotation_minus[0]).to(
+            #    'cuda').type(torch.float32)
+            #x_minus[4:9, 4:9] = o3.wigner_D(2, x_rotation_minus[2], x_rotation_minus[1], x_rotation_minus[0]).to(
+            #    'cuda').type(torch.float32)
+            ## x2 = o3.wigner_D(2, x_rotation[2], x_rotation[1], x_rotation[0]).to('cuda').type(torch.float32)
+
+            x_minus = torch.asarray([
+                [1, 0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 1, 0, 0, 0, 0, 0, 0],
+                [0, -1, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 1, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0, 1, 0],
+                [0, 0, 0, 0, 0, -1, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, -1/2, 0, -np.sqrt(3)/2],
+                [0, 0, 0, 0, -1, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, -np.sqrt(3)/2, 0, 1/2],
+            ]).to('cuda').type(torch.float32)
+            x_plus = x_minus.T
+
+            m_alpha = Z(alpha)
+            m_beta = Z(beta)
+            m_gamma = Z(gamma)
+
+            D = m_gamma @ x_minus @ m_beta @ x_plus @ m_alpha
+
+            Y_1 = self._features_rest_original[:, [0, 1, 2]]
+            Y_1_rotated = torch.matmul(D[1:4, 1:4], Y_1)
             self._features_rest[:, [0, 1, 2]] = Y_1_rotated
 
-            # D_2 = torch.from_numpy(sphecerix.tesseral_wigner_D(2, Robj)).to('cuda').type(torch.float32)
-            D_2 = o3.wigner_D(2, aby[2], aby[1], aby[0]).to('cuda').type(torch.float32)
-            Y_2 = self._features_rest[:, [3, 4, 5, 6, 7]]
-            Y_2_rotated = torch.matmul(D_2, Y_2)
-            # Y_2_rotated.requires_grad = True
+            Y_2 = self._features_rest_original[:, [3, 4, 5, 6, 7]]
+            Y_2_rotated = torch.matmul(D[4:9, 4:9], Y_2)
             self._features_rest[:, [3, 4, 5, 6, 7]] = Y_2_rotated
 
-            # D_3 = torch.from_numpy(sphecerix.tesseral_wigner_D(3, Robj)).to('cuda').type(torch.float32)
-            D_3 = o3.wigner_D(3, aby[2], aby[1], aby[0]).to('cuda').type(torch.float32)
-            Y_3 = self._features_rest[:, [8, 9, 10, 11, 12, 13, 14]]
-            Y_3_rotated = torch.matmul(D_3, Y_3)
+            #Y_3 = self._features_rest[:, [8, 9, 10, 11, 12, 13, 14]]
+            #Y_3_rotated = torch.matmul(D_3, Y_3)
             # Y_3_rotated.requires_grad = True
-            self._features_rest[:, [8, 9, 10, 11, 12, 13, 14]] = Y_3_rotated
+            #self._features_rest[:, [8, 9, 10, 11, 12, 13, 14]] = torch.zeros_like(Y_3)
+
+            if False:
+                # D_1_sphecerix = torch.from_numpy(sphecerix.tesseral_wigner_D(1, Robj)).to('cuda').type(torch.float32)
+                # D_1 = o3.wigner_D(1, aby[2], aby[1], aby[0]).to('cuda').type(torch.float32)
+                Y_1 = self._features_rest[:, [0, 1, 2]]
+                Y_1_rotated = torch.matmul(matrix[1:, 1:], Y_1)  # torch.matmul(D_1, Y_1)  # torch.matmul(R, Y_1)
+                # Y_1_rotated.requires_grad = True
+                self._features_rest[:, [0, 1, 2]] = Y_1_rotated
+
+                # D_2 = torch.from_numpy(sphecerix.tesseral_wigner_D(2, Robj)).to('cuda').type(torch.float32)
+                D_2 = o3.wigner_D(2, aby[2], aby[1], aby[0]).to('cuda').type(torch.float32)
+                Y_2 = self._features_rest[:, [3, 4, 5, 6, 7]]
+                Y_2_rotated = torch.matmul(D_2, Y_2)
+                # Y_2_rotated.requires_grad = True
+                self._features_rest[:, [3, 4, 5, 6, 7]] = torch.zeros_like(Y_2_rotated)
+
+                # D_3 = torch.from_numpy(sphecerix.tesseral_wigner_D(3, Robj)).to('cuda').type(torch.float32)
+                D_3 = o3.wigner_D(3, aby[2], aby[1], aby[0]).to('cuda').type(torch.float32)
+                Y_3 = self._features_rest[:, [8, 9, 10, 11, 12, 13, 14]]
+                Y_3_rotated = torch.matmul(D_3, Y_3)
+                # Y_3_rotated.requires_grad = True
+                self._features_rest[:, [8, 9, 10, 11, 12, 13, 14]] = torch.zeros_like(Y_3_rotated)
 
     def apply_transformation(self, T):
         self.apply_transformation_on_xyz(T=T)
