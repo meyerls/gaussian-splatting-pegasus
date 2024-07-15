@@ -19,8 +19,8 @@ from plyfile import PlyData, PlyElement
 import open3d as o3d
 from scipy.spatial.transform import Rotation
 from e3nn import o3
-import sphecerix
-import pyshtools as shtools
+#import sphecerix
+#import pyshtools as shtools
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
